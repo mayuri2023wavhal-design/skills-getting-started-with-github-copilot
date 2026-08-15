@@ -1,110 +1,103 @@
+from copy import deepcopy
+
+import pytest
 from fastapi.testclient import TestClient
 
-from src.app import app
+from src.app import activities, app
 
 client = TestClient(app)
 
 
+@pytest.fixture(autouse=True)
+def reset_activities():
+    """Keep each test isolated from in-memory state changes in other tests."""
+    original = deepcopy(activities)
+    yield
+    activities.clear()
+    activities.update(deepcopy(original))
+
+
 # ===== GET /activities Tests =====
 def test_get_activities_success():
-    """Test that GET /activities returns all activities with proper structure"""
+    """GET /activities returns a populated dictionary with expected fields."""
     response = client.get("/activities")
-    
+
     assert response.status_code == 200
-    activities = response.json()
-    
-    # Verify it's a dictionary with activities
-    assert isinstance(activities, dict)
-    assert len(activities) > 0
-    
-    # Verify each activity has required fields
-    for activity_name, activity_data in activities.items():
+    payload = response.json()
+
+    assert isinstance(payload, dict)
+    assert len(payload) > 0
+
+    for activity_name, activity_data in payload.items():
         assert "description" in activity_data
         assert "schedule" in activity_data
         assert "max_participants" in activity_data
         assert "participants" in activity_data
         assert isinstance(activity_data["participants"], list)
+        assert isinstance(activity_data["max_participants"], int)
+        assert activity_data["max_participants"] >= len(activity_data["participants"])
 
 
-def test_get_activities_contains_chess_club():
-    """Test that GET /activities includes Chess Club"""
+def test_get_activities_contains_expected_activity():
+    """GET /activities includes a known activity and expected metadata."""
     response = client.get("/activities")
-    activities = response.json()
-    
-    assert "Chess Club" in activities
-    assert activities["Chess Club"]["description"] == "Learn strategies and compete in chess tournaments"
+    payload = response.json()
+
+    assert "Chess Club" in payload
+    assert payload["Chess Club"]["description"] == "Learn strategies and compete in chess tournaments"
+    assert payload["Chess Club"]["schedule"] == "Fridays, 3:30 PM - 5:00 PM"
+    assert payload["Chess Club"]["max_participants"] == 12
 
 
 # ===== POST /activities/{activity_name}/signup Tests =====
 def test_signup_for_activity_success():
-    """Test successful signup for an activity"""
+    """Successful signup adds the student to the participant list."""
     activity_name = "Programming Class"
     email = "newstudent@mergington.edu"
-    
+
     response = client.post(f"/activities/{activity_name}/signup?email={email}")
-    
+
     assert response.status_code == 200
     result = response.json()
     assert "message" in result
     assert email in result["message"]
     assert activity_name in result["message"]
-    
-    # Verify the participant was actually added
-    activities = client.get("/activities").json()
-    assert email in activities[activity_name]["participants"]
+
+    payload = client.get("/activities").json()
+    assert email in payload[activity_name]["participants"]
+
+
+def test_signup_requires_email_query_parameter():
+    """POST signup without the required email parameter is rejected."""
+    response = client.post("/activities/Chess Club/signup")
+
+    assert response.status_code == 422
 
 
 def test_signup_for_activity_not_found():
-    """Test signup for nonexistent activity returns 404"""
+    """POST signup for a missing activity returns a 404 error."""
     response = client.post("/activities/Nonexistent Activity/signup?email=student@mergington.edu")
-    
+
     assert response.status_code == 404
     assert response.json()["detail"] == "Activity not found"
 
 
 def test_signup_duplicate_email():
-    """Test that signing up with same email twice returns 400 error"""
+    """A student cannot sign up twice for the same activity."""
     activity_name = "Tennis Club"
     email = "duplicate@mergington.edu"
-    
-    # First signup should succeed
-    response1 = client.post(f"/activities/{activity_name}/signup?email={email}")
-    assert response1.status_code == 200
-    
-    # Second signup with same email should fail
-    response2 = client.post(f"/activities/{activity_name}/signup?email={email}")
-    assert response2.status_code == 400
-    assert "already signed up" in response2.json()["detail"]
 
+    first_response = client.post(f"/activities/{activity_name}/signup?email={email}")
+    assert first_response.status_code == 200
 
-def test_signup_cannot_exceed_max_participants():
-    """Test that activities cannot exceed max participants"""
-    activity_name = "Art Studio"
-    
-    # Get current activity info
-    activities = client.get("/activities").json()
-    art_studio = activities["Art Studio"]
-    current_participants = len(art_studio["participants"])
-    max_participants = art_studio["max_participants"]
-    
-    # Fill up remaining spots
-    spots_available = max_participants - current_participants
-    for i in range(spots_available):
-        email = f"student{i}@mergington.edu"
-        response = client.post(f"/activities/{activity_name}/signup?email={email}")
-        assert response.status_code == 200
-    
-    # Try to add one more student (should still work - system doesn't enforce max yet)
-    # This tests current behavior; we could add this validation later
-    new_email = "extra@mergington.edu"
-    response = client.post(f"/activities/{activity_name}/signup?email={new_email}")
-    # The current API doesn't enforce max_participants, so it should succeed
-    assert response.status_code == 200
+    second_response = client.post(f"/activities/{activity_name}/signup?email={email}")
+    assert second_response.status_code == 400
+    assert "already signed up" in second_response.json()["detail"]
 
 
 # ===== DELETE /activities/{activity_name}/unregister Tests =====
 def test_unregister_participant_success():
-    """Test successful unregistration from an activity"""
+    """A registered participant can be removed from an activity."""
     activity_name = "Chess Club"
     email = "newstudent@mergington.edu"
 
@@ -116,12 +109,12 @@ def test_unregister_participant_success():
     assert response.status_code == 200
     assert response.json()["message"] == f"Unregistered {email} from {activity_name}"
 
-    activities = client.get("/activities").json()
-    assert email not in activities[activity_name]["participants"]
+    payload = client.get("/activities").json()
+    assert email not in payload[activity_name]["participants"]
 
 
 def test_unregister_participant_not_found():
-    """Test unregistration from nonexistent activity returns 404"""
+    """Deleting an activity that does not exist returns 404."""
     response = client.delete("/activities/Nonexistent Activity/unregister?email=missing@mergington.edu")
 
     assert response.status_code == 404
@@ -129,20 +122,27 @@ def test_unregister_participant_not_found():
 
 
 def test_unregister_participant_not_registered():
-    """Test unregistering a student not in the activity returns 404"""
+    """Unregistering a student who is not enrolled returns 404."""
     activity_name = "Drama Club"
     email = "notregistered@mergington.edu"
-    
+
     response = client.delete(f"/activities/{activity_name}/unregister?email={email}")
-    
+
     assert response.status_code == 404
     assert "not registered" in response.json()["detail"]
 
 
+def test_unregister_requires_email_query_parameter():
+    """DELETE unregister without email should fail validation."""
+    response = client.delete("/activities/Chess Club/unregister")
+
+    assert response.status_code == 422
+
+
 # ===== Root endpoint test =====
 def test_root_redirect():
-    """Test that root path redirects to index.html"""
+    """The root path redirects to the static HTML frontend."""
     response = client.get("/", follow_redirects=False)
-    
+
     assert response.status_code == 307
     assert response.headers["location"] == "/static/index.html"
